@@ -14,5 +14,5 @@ __pycache__/
 .vscode/
 .idea/
 
-# Generated results
-results/
+# Generated results (only the root example output is ignored)
+/results/
