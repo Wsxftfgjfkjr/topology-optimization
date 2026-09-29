@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+import scipy.sparse as sparse
 
 from topoopt import fem
 
@@ -165,6 +166,119 @@ def test_global_stiffness_scales_with_the_element_moduli():
     )
 
     assert np.allclose((doubled - 2.0 * unit).toarray(), 0.0)
+
+
+# --------------------------------------------------------------------------
+# Cached assembly structure
+# --------------------------------------------------------------------------
+
+
+def _reference_assembly(mesh, element_stiffness, element_moduli):
+    """The reference COO scatter, spelled out independently of the cached plan.
+
+    This is ``v0.1-reference``'s ``assemble_stiffness_matrix`` verbatim: build all
+    64 * n_elements (row, column) pairs and let ``coo_matrix`` sum the duplicates
+    while converting to CSC.  Keeping it here means the cached path is checked
+    against a restatement of the reference rather than against itself.
+    """
+    element_dofs = mesh.element_dofs
+    rows = np.repeat(element_dofs, 8, axis=1).reshape(-1)
+    columns = np.tile(element_dofs, (1, 8)).reshape(-1)
+    values = (
+        element_stiffness.reshape(-1)[None, :] * element_moduli[:, None]
+    ).reshape(-1)
+
+    return sparse.coo_matrix(
+        (values, (rows, columns)), shape=(mesh.n_dofs, mesh.n_dofs)
+    ).tocsc()
+
+
+def _moduli(mesh):
+    """A SIMP-shaped but otherwise arbitrary positive field."""
+    return 1e-9 + np.linspace(0.01, 1.0, mesh.n_elements) ** 3 * (1.0 - 1e-9)
+
+
+@pytest.mark.parametrize("nelx,nely", [(3, 2), (6, 5), (10, 4)])
+def test_cached_assembly_reproduces_the_coo_reference_bit_for_bit(nelx, nely):
+    """The cached structure must not change the assembled numbers at all.
+
+    Only the summation *order* is at stake: the cached path accumulates entries
+    into their CSC slot in COO order, which is the order SciPy's COO -> CSC
+    conversion sums them in, so even the last bit must survive.
+    """
+    mesh = fem.Mesh(nelx, nely)
+    element_stiffness = fem.element_stiffness_matrix(YOUNGS, POISSON)
+
+    assembled = fem.assemble_stiffness_matrix(mesh, element_stiffness, _moduli(mesh))
+    reference = _reference_assembly(mesh, element_stiffness, _moduli(mesh))
+
+    assert assembled.format == "csc"
+    assert np.array_equal(assembled.indptr, reference.indptr)
+    assert np.array_equal(assembled.indices, reference.indices)
+    assert np.array_equal(assembled.data, reference.data)
+
+
+@pytest.mark.parametrize("nelx,nely", [(6, 5), (12, 4)])
+def test_cached_assembly_is_bit_exact_across_unrelated_moduli(nelx, nely):
+    """The same cached plan must be valid for every value field, not just one."""
+    mesh = fem.Mesh(nelx, nely)
+    element_stiffness = fem.element_stiffness_matrix(YOUNGS, POISSON)
+    rng = np.random.default_rng(7)
+
+    fields = [
+        np.ones(mesh.n_elements),
+        _moduli(mesh),
+        rng.random(mesh.n_elements) + 1e-3,
+    ]
+
+    for moduli in fields:
+        assembled = fem.assemble_stiffness_matrix(mesh, element_stiffness, moduli)
+        reference = _reference_assembly(mesh, element_stiffness, moduli)
+        assert np.array_equal(assembled.data, reference.data)
+
+
+def test_assembly_plan_is_cached_per_mesh():
+    mesh = fem.Mesh(4, 3)
+
+    plan = mesh.assembly_plan
+
+    assert mesh.assembly_plan is plan
+    # Each mesh owns its own plan: the structure is derived from its element_dofs.
+    assert fem.Mesh(4, 3).assembly_plan is not plan
+
+
+def test_assembly_plan_scatter_map_covers_every_entry_exactly_once():
+    mesh = fem.Mesh(4, 3)
+    plan = mesh.assembly_plan
+
+    assert plan.slot.shape == (64 * mesh.n_elements,)
+    assert plan.indptr.shape == (mesh.n_dofs + 1,)
+    assert plan.indptr[0] == 0
+    assert plan.indptr[-1] == plan.nnz
+    assert plan.indices.shape == (plan.nnz,)
+
+    # Every COO entry lands in a slot, and every slot receives at least one
+    # entry -- an unreachable slot would be a structural entry that is always
+    # zero, which the assembled matrix does not have.
+    assert plan.slot.min() == 0
+    assert plan.slot.max() == plan.nnz - 1
+    assert np.bincount(plan.slot, minlength=plan.nnz).min() > 0
+
+
+def test_assembly_plan_structure_is_independent_of_the_element_stiffness():
+    """A different constitutive matrix changes values, never the pattern."""
+    mesh = fem.Mesh(4, 3)
+    plan = mesh.assembly_plan
+    before = (plan.indptr.copy(), plan.indices.copy(), plan.slot.copy())
+
+    other_stiffness = fem.element_stiffness_matrix(2.5, 0.15)
+    assembled = fem.assemble_stiffness_matrix(mesh, other_stiffness, _moduli(mesh))
+
+    assert mesh.assembly_plan is plan
+    assert np.array_equal(plan.indptr, before[0])
+    assert np.array_equal(plan.indices, before[1])
+    assert np.array_equal(plan.slot, before[2])
+    assert assembled.nnz == plan.nnz
 
 
 def test_free_degrees_of_freedom_complement_the_restrained_ones():

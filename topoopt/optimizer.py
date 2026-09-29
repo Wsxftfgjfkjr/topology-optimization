@@ -214,6 +214,13 @@ class TopologyOptimizer:
         self.free_dofs = fem.free_degrees_of_freedom(mesh.n_dofs, self.fixed_dofs)
         self.density = np.full((mesh.nely, mesh.nelx), self.volfrac)
 
+        # The assembly sparsity structure is a property of the mesh, so it is
+        # built here rather than on the first analyze() call: the cost is then
+        # paid once at construction instead of inside the optimization loop.  It
+        # is cached on the mesh, so a second optimizer over the same mesh reuses
+        # it.
+        mesh.assembly_plan  # noqa: B018 - primes the cache deliberately
+
     def element_moduli(self):
         """SIMP interpolation of the element Young's moduli."""
         density = self.density.reshape(-1)

@@ -123,6 +123,24 @@ class Mesh:
         self.element_dofs = self._build_element_dofs()
         self.node_coordinates = self._build_node_coordinates()
 
+        # Built on first use; see Mesh.assembly_plan.
+        self._assembly_plan = None
+
+    @property
+    def assembly_plan(self) -> "StiffnessAssemblyPlan":
+        """Sparsity structure for assembling this mesh's stiffness matrix.
+
+        Lazily built and cached, because it is derived from ``element_dofs``
+        alone -- which this class fixes at construction and never mutates -- and
+        is therefore reusable for every assembly on this mesh.  Caching it on the
+        mesh makes that validity explicit: the cache lives exactly as long as the
+        connectivity it was derived from.
+        """
+        plan = self._assembly_plan
+        if plan is None:
+            plan = self._assembly_plan = StiffnessAssemblyPlan(self)
+        return plan
+
     def __repr__(self) -> str:
         return f"Mesh(nelx={self.nelx}, nely={self.nely})"
 
@@ -159,8 +177,140 @@ class Mesh:
         return np.stack([i_index.ravel(), j_index.ravel()], axis=-1).astype(float)
 
 
+class StiffnessAssemblyPlan:
+    """Precomputed sparsity structure for assembling a mesh's stiffness matrix.
+
+    Why this is cached
+    ------------------
+    ``Mesh.element_dofs`` is built once in :meth:`Mesh.__init__` and never
+    mutated, so the mesh alone fixes every structural quantity of the assembly:
+
+    * which ``(row, column)`` degree-of-freedom pair each of the 64 entries of an
+      element matrix is scattered to,
+    * the CSC sparsity structure ``(indptr, indices)`` of the assembled matrix,
+    * ``slot``, the CSC data slot that each of those entries accumulates into.
+
+    In a topology-optimization loop the mesh is fixed and only the element moduli
+    change, so rebuilding those three arrays every iteration recomputes the same
+    answer.  Precomputing them turns each assembly into one scatter-add and
+    removes the per-iteration COO index construction and SciPy's COO -> CSC sort
+    from the hot path.
+
+    Nothing here depends on ``element_stiffness``: it scales values, never the
+    pattern, so the plan stays valid if the constitutive matrix changes too.
+
+    Construction works on a few temporaries the size of the COO entry list
+    (``64 * n_elements``).  They are released as soon as they are dead rather
+    than left to accumulate: this is a one-off cost per mesh, but resident-set
+    size is a high-water mark, so the peak it reaches is paid for by the rest of
+    the run.
+
+    Parameters
+    ----------
+    mesh : Mesh
+        The mesh whose connectivity is captured.  The plan stays valid only while
+        ``mesh.element_dofs`` and ``mesh.n_dofs`` are unchanged.
+    """
+
+    def __init__(self, mesh: Mesh):
+        n_dofs = mesh.n_dofs
+        element_dofs = mesh.element_dofs
+
+        # The (row, column) pair of every one of the 64 entries of every element
+        # matrix.  ``np.repeat`` walks the eight element DOFs slowly (row index)
+        # and ``np.tile`` walks them quickly (column index), which lines up with
+        # the C-order ravel of the element matrix.
+        rows = np.repeat(element_dofs, 8, axis=1).reshape(-1)
+        columns = np.tile(element_dofs, (1, 8)).reshape(-1)
+        n_entries = rows.size
+
+        # Packing each pair into one integer makes "sort by (column, row)" an
+        # integer sort, which NumPy does with a linear-time radix pass, and lets
+        # the column buffer double as the key: ``columns`` is freshly allocated by
+        # ``np.tile`` above and is not read again.  Both indices are below
+        # n_dofs, so the key stays under n_dofs**2 -- far below 2**63 for any
+        # mesh that fits in memory.
+        key = columns
+        key *= n_dofs
+        key += rows
+        del rows
+
+        # Sorting by (column, row) puts the entries into CSC order and brings the
+        # ones that share a pair -- the ones COO would have summed -- next to
+        # each other, so a single pass yields both the CSC structure and the slot
+        # map below.
+        order = np.argsort(key, kind="stable")
+        sorted_key = key[order]
+        del key
+
+        # First entry of each run of identical (column, row) pairs.
+        starts = np.empty(n_entries, dtype=bool)
+        starts[0] = True
+        np.not_equal(sorted_key[1:], sorted_key[:-1], out=starts[1:])
+
+        # ``slot[i]`` is the CSC data slot that COO entry ``i`` accumulates into.
+        # Entries sharing a slot are exactly those sharing a (row, column) pair,
+        # so consecutive slots follow the sorted order.
+        self.slot = np.empty(n_entries, dtype=np.intp)
+        self.slot[order] = np.cumsum(starts) - 1
+        del order
+
+        # SciPy selects int32 indices whenever every index fits; matching its
+        # choice here means csc_matrix() is handed arrays it can keep as they
+        # are, instead of re-casting (and copying) them on every assembly.
+        index_dtype = (
+            np.int32 if max(n_dofs, n_entries) <= np.iinfo(np.int32).max
+            else np.int64
+        )
+
+        unique_pairs = sorted_key[starts]
+        del sorted_key
+        self.indices = (unique_pairs % n_dofs).astype(index_dtype, copy=False)
+
+        indptr = np.zeros(n_dofs + 1, dtype=np.intp)
+        np.cumsum(
+            np.bincount(unique_pairs // n_dofs, minlength=n_dofs), out=indptr[1:]
+        )
+        self.indptr = indptr.astype(index_dtype, copy=False)
+
+        self.shape = (n_dofs, n_dofs)
+        self.nnz = int(self.indptr[-1])
+
+    def assemble(self, element_stiffness, element_moduli):
+        """Scatter element matrices into this plan's fixed CSC structure.
+
+        Parameters
+        ----------
+        element_stiffness : ndarray, shape (8, 8)
+            Element stiffness matrix for unit Young's modulus.
+        element_moduli : ndarray, shape (n_elements,)
+            Young's modulus of each element, in the mesh's element order.
+
+        Returns
+        -------
+        csc_matrix, shape (n_dofs, n_dofs)
+            Symmetric positive definite once the rigid body modes are restrained.
+        """
+        values = (
+            element_stiffness.reshape(-1)[None, :] * element_moduli[:, None]
+        ).reshape(-1)
+
+        # Each entry adds into the slot of its (row, column) pair.  ``bincount``
+        # walks the entries in COO order and accumulates in place, which is the
+        # same order SciPy's COO -> CSC conversion sums them in, so the result is
+        # bit-for-bit the reference assembly (see tests/test_fem.py).
+        data = np.bincount(self.slot, weights=values, minlength=self.nnz)
+        return sparse.csc_matrix(
+            (data, self.indices, self.indptr), shape=self.shape
+        )
+
+
 def assemble_stiffness_matrix(mesh, element_stiffness, element_moduli):
     """Assemble the global stiffness matrix as a sparse CSC matrix.
+
+    The mesh caches the sparsity structure and the COO -> CSC scatter map (see
+    :class:`StiffnessAssemblyPlan`), so repeated assemblies on an unchanged mesh
+    only recompute values.
 
     Parameters
     ----------
@@ -175,21 +325,7 @@ def assemble_stiffness_matrix(mesh, element_stiffness, element_moduli):
     csc_matrix, shape (n_dofs, n_dofs)
         Symmetric positive definite once the rigid body modes are restrained.
     """
-    element_dofs = mesh.element_dofs
-
-    # Scatter each 8 x 8 element matrix into its 64 (row, column) positions.
-    # ``np.repeat`` walks the eight element DOFs slowly (row index) and
-    # ``np.tile`` walks them quickly (column index), which lines up with the
-    # C-order ravel of the element matrix.
-    rows = np.repeat(element_dofs, 8, axis=1).reshape(-1)
-    columns = np.tile(element_dofs, (1, 8)).reshape(-1)
-    values = (element_stiffness.reshape(-1)[None, :] * element_moduli[:, None]).reshape(-1)
-
-    # COO sums the duplicated (row, column) pairs while converting to CSC.
-    stiffness = sparse.coo_matrix(
-        (values, (rows, columns)), shape=(mesh.n_dofs, mesh.n_dofs)
-    )
-    return stiffness.tocsc()
+    return mesh.assembly_plan.assemble(element_stiffness, element_moduli)
 
 
 def free_degrees_of_freedom(n_dofs, fixed_dofs):

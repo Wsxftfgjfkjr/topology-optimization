@@ -96,6 +96,20 @@ def test_analysis_returns_finite_positive_compliance():
     assert np.all(element_energy >= 0.0)
 
 
+def test_optimizer_primes_the_mesh_assembly_plan_at_construction():
+    """The one-time structural cost belongs to construction, not to iteration 1.
+
+    The plan is a property of the mesh, so it is deliberately built while the
+    optimizer is being set up rather than on the first ``analyze()`` call.
+    """
+    mesh, fixed_dofs, loads = _cantilever(10, 4)
+    assert mesh._assembly_plan is None
+
+    _optimizer(mesh, fixed_dofs, loads)
+
+    assert mesh._assembly_plan is not None
+
+
 def test_solid_cantilever_compliance_matches_slender_beam_theory():
     """Compare the assembled system against an independent physical theory.
 
