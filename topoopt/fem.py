@@ -329,18 +329,191 @@ def assemble_stiffness_matrix(mesh, element_stiffness, element_moduli):
 
 
 def free_degrees_of_freedom(n_dofs, fixed_dofs):
-    """Indices of the degrees of freedom that are not restrained."""
+    """Indices of the degrees of freedom that are not restrained.
+
+    The result is strictly increasing, which is what
+    :class:`ReducedSystemPlan` requires of a free DOF set.
+    """
     return np.setdiff1d(np.arange(n_dofs, dtype=np.intp), np.asarray(fixed_dofs, dtype=np.intp))
 
 
-def solve_displacements(stiffness, loads, free_dofs):
+class ReducedSystemPlan:
+    """Precomputed map from a global CSC stiffness matrix to its free/free form.
+
+    Why this is cached
+    ------------------
+    Restraining the fixed degrees of freedom reduces ``K`` to the ``free_dofs``
+    rows and columns.  The direct spelling::
+
+        stiffness.tocsr()[free_dofs, :][:, free_dofs].tocsc()
+
+    converts the whole matrix to CSR, slices it twice and converts the result
+    back to CSC -- four passes over the entry list per solve, all of them
+    returning the same answer as long as the mesh and the boundary conditions
+    hold.  In a topology-optimization run they do hold for the entire run: only
+    the numerical values change.
+
+    What is invariant
+    -----------------
+    The reduced matrix consists of exactly those global CSC entries whose row
+    *and* column are free, in global CSC order.  Nothing is summed and nothing
+    is dropped -- the assembled global matrix is canonical, so the selected
+    entries stay distinct -- which makes the reduced ``data`` array a plain
+    selection of the global one.  Which entries are selected, their reduced row
+    indices and the reduced column pointers depend on the structure alone, and
+    are computed once here.
+
+    Requiring ``free_dofs`` to be strictly increasing is what keeps the
+    selection a subsequence: the reduced columns then follow the global column
+    order, so no entry has to be reordered.  :func:`free_degrees_of_freedom`
+    returns such an array.
+
+    Validity
+    --------
+    A plan is valid for every matrix whose CSC structure equals the one it was
+    built from; values are irrelevant.  In production that structure comes from
+    the very :class:`StiffnessAssemblyPlan` that assembles every matrix the plan
+    is used on, so the two cannot drift apart.  :meth:`reduce` still checks what
+    it is handed rather than trusting it, because the alternative to an
+    exception here is a wrong answer rather than a crash.
+
+    Constructing the plan costs a few temporaries the size of the global entry
+    list; they are released as soon as they are dead.  What the plan *retains*
+    is one boolean mask over the global entries plus the reduced CSC structure
+    -- about five bytes per stored entry, against the twelve the assembled
+    matrix itself occupies.
+
+    Parameters
+    ----------
+    global_structure : StiffnessAssemblyPlan or csc_matrix
+        The structure being reduced.  Any object exposing ``indptr``,
+        ``indices`` and ``shape`` is accepted.  Both arrays are referenced
+        rather than copied, so a plan built from an assembly plan does not add
+        a second copy of the global structure to the process.
+    free_dofs : array_like of int
+        Strictly increasing indices of the unrestrained degrees of freedom.
+    """
+
+    def __init__(self, global_structure, free_dofs):
+        shape = tuple(global_structure.shape)
+        if len(shape) != 2 or shape[0] != shape[1]:
+            raise ValueError(f"the structure being reduced must be square, got {shape}")
+
+        indptr = np.asarray(global_structure.indptr)
+        indices = np.asarray(global_structure.indices)
+        n_dofs = shape[0]
+
+        free = np.asarray(free_dofs, dtype=np.intp)
+        if free.ndim != 1:
+            raise ValueError("free_dofs must be one-dimensional")
+        if free.size and np.any(np.diff(free) <= 0):
+            raise ValueError("free_dofs must be strictly increasing")
+        if free.size and (free[0] < 0 or free[-1] >= n_dofs):
+            raise ValueError(f"free_dofs must lie in [0, {n_dofs})")
+
+        # The column each global CSC entry belongs to: entry k falls in the
+        # column whose indptr span covers it, and np.repeat lays that out
+        # directly from the per-column entry counts.
+        column_of_entry = np.repeat(np.arange(n_dofs, dtype=indices.dtype), np.diff(indptr))
+
+        is_free = np.zeros(n_dofs, dtype=bool)
+        is_free[free] = True
+
+        # An entry survives exactly when both of its endpoints are free.  The
+        # survivors are already grouped by column and ascending within each
+        # column, so they *are* the reduced CSC arrays, in order.
+        self._keep = is_free[indices] & is_free[column_of_entry]
+
+        # SciPy's index dtype for the global matrix is reused: the reduced
+        # indices are a subset of the global ones, so they cannot overflow a
+        # dtype that already holds them, and the result is then handed back to
+        # SciPy in the form it would have chosen itself.
+        dtype = indices.dtype
+        self.indptr = np.zeros(free.size + 1, dtype=dtype)
+        counts = np.bincount(column_of_entry[self._keep], minlength=n_dofs)
+        self.indptr[1:] = np.cumsum(counts[free])
+
+        reduced_row = np.full(n_dofs, -1, dtype=dtype)
+        reduced_row[free] = np.arange(free.size, dtype=dtype)
+        self.indices = reduced_row[indices[self._keep]]
+
+        self._global_shape = shape
+        self._global_nnz = int(indptr[-1])
+        self._global_indptr = indptr
+        self._global_indices = indices
+        self.shape = (free.size, free.size)
+        self.nnz = int(self.indptr[-1])
+
+    def reduce(self, stiffness):
+        """Extract the free/free submatrix from an assembled stiffness matrix.
+
+        Parameters
+        ----------
+        stiffness : csc_matrix
+            A matrix with the CSC structure this plan was built from.  Only its
+            ``data`` array may differ.
+
+        Returns
+        -------
+        csc_matrix, shape (n_free, n_free)
+            Acceptable to :func:`scipy.sparse.linalg.spsolve` as it stands.
+        """
+        self._check_structure(stiffness)
+        return sparse.csc_matrix(
+            (stiffness.data[self._keep], self.indices, self.indptr),
+            shape=self.shape,
+        )
+
+    def _check_structure(self, stiffness):
+        """Reject anything that is not the structure this plan maps from."""
+        if stiffness.format != "csc":
+            raise ValueError(
+                f"the reduced-system plan maps from a CSC matrix, not {stiffness.format!r}"
+            )
+        if stiffness.shape != self._global_shape or stiffness.nnz != self._global_nnz:
+            raise ValueError(
+                f"expected a {self._global_shape} matrix with {self._global_nnz} "
+                f"stored entries, got {stiffness.shape} with {stiffness.nnz}"
+            )
+        # The identity test is only a fast path -- SciPy keeps indptr by
+        # reference, so a matrix from this plan's own assembly hits it -- and
+        # the value comparison is what actually establishes equivalence.
+        if stiffness.indptr is not self._global_indptr and not np.array_equal(
+            stiffness.indptr, self._global_indptr
+        ):
+            raise ValueError("the CSC indptr array differs from this plan's structure")
+        if stiffness.indices is not self._global_indices and not np.array_equal(
+            stiffness.indices, self._global_indices
+        ):
+            raise ValueError("the CSC indices array differs from this plan's structure")
+
+
+def solve_displacements(stiffness, loads, free_dofs, plan=None):
     """Solve ``K U = F`` with the restrained degrees of freedom held at zero.
 
     The system is reduced to the free degrees of freedom and solved with
     SciPy's sparse LU solver; the restrained entries of the returned vector
     stay at zero.
+
+    Parameters
+    ----------
+    stiffness : csc_matrix
+        Assembled global stiffness matrix.
+    loads : ndarray, shape (n_dofs,)
+        Nodal load vector.
+    free_dofs : array_like of int
+        Strictly increasing indices of the unrestrained degrees of freedom.
+    plan : ReducedSystemPlan, optional
+        Reduction precomputed for this structure and free DOF set.  Passing it
+        is what makes repeated solves on an unchanged mesh cheap.  Leaving it
+        out builds a throwaway plan, which gives the same answer but performs
+        more work than the slicing it replaces, so a caller that solves more
+        than once should always pass one.
     """
+    if plan is None:
+        plan = ReducedSystemPlan(stiffness, free_dofs)
+
     displacements = np.zeros(stiffness.shape[0])
-    reduced = stiffness.tocsr()[free_dofs, :][:, free_dofs].tocsc()
+    reduced = plan.reduce(stiffness)
     displacements[free_dofs] = sparse_linalg.spsolve(reduced, loads[free_dofs])
     return displacements

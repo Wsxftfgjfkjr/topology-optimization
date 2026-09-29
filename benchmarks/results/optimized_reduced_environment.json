@@ -1,0 +1,62 @@
+{
+  "run_id": "20260929T065604Z",
+  "timestamp_utc": "2026-09-29T06:57:31Z",
+  "label": "optimized_reduced",
+  "python": {
+    "version": "3.12.14",
+    "implementation": "CPython",
+    "executable": "python"
+  },
+  "numpy": {
+    "version": "2.5.3"
+  },
+  "scipy": {
+    "version": "1.18.1"
+  },
+  "platform": {
+    "system": "Darwin",
+    "release": "25.5.0",
+    "machine": "arm64",
+    "cpu_model": "Mac17,3",
+    "cpu_count": 10
+  },
+  "thread_environment": {
+    "OMP_NUM_THREADS": null,
+    "OPENBLAS_NUM_THREADS": null,
+    "MKL_NUM_THREADS": null,
+    "VECLIB_MAXIMUM_THREADS": null,
+    "NUMEXPR_NUM_THREADS": null
+  },
+  "methodology": {
+    "subprocess_per_case": true,
+    "warmups": 1,
+    "repetitions": 3,
+    "config": {
+      "volfrac": 0.4,
+      "penal": 3.0,
+      "rmin": 1.5,
+      "max_iterations": 200,
+      "tolerance": 0.01
+    },
+    "timed_region": "TopologyOptimizer.run() only",
+    "excluded_from_timing": [
+      "process start-up and imports",
+      "optimizer construction",
+      "plotting",
+      "CSV and JSON writing"
+    ]
+  },
+  "cases": [
+    "60x20",
+    "120x40",
+    "240x80"
+  ],
+  "deliberately_excluded": [
+    "hostname",
+    "username",
+    "home directory",
+    "working directory",
+    "full interpreter path",
+    "environment variables other than the BLAS thread settings above"
+  ]
+}

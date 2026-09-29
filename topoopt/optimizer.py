@@ -214,12 +214,16 @@ class TopologyOptimizer:
         self.free_dofs = fem.free_degrees_of_freedom(mesh.n_dofs, self.fixed_dofs)
         self.density = np.full((mesh.nely, mesh.nelx), self.volfrac)
 
-        # The assembly sparsity structure is a property of the mesh, so it is
-        # built here rather than on the first analyze() call: the cost is then
-        # paid once at construction instead of inside the optimization loop.  It
-        # is cached on the mesh, so a second optimizer over the same mesh reuses
-        # it.
+        # The two plans below describe quantities the mesh and the boundary
+        # conditions fix for the whole run -- the global sparsity structure, and
+        # the free DOF set together with its order -- so both are built here
+        # rather than on the first analyze() call: the cost is paid once at
+        # construction instead of inside the optimization loop.  The assembly
+        # plan is cached on the mesh, so a second optimizer over the same mesh
+        # reuses it; the reduced-system plan is derived from it and would only
+        # be reusable for the same free DOF set, so it is not.
         mesh.assembly_plan  # noqa: B018 - primes the cache deliberately
+        self.reduced_system = fem.ReducedSystemPlan(mesh.assembly_plan, self.free_dofs)
 
     def element_moduli(self):
         """SIMP interpolation of the element Young's moduli."""
@@ -243,7 +247,9 @@ class TopologyOptimizer:
         stiffness = fem.assemble_stiffness_matrix(
             self.mesh, self.element_stiffness, self.element_moduli()
         )
-        displacements = fem.solve_displacements(stiffness, self.loads, self.free_dofs)
+        displacements = fem.solve_displacements(
+            stiffness, self.loads, self.free_dofs, plan=self.reduced_system
+        )
         compliance = float(displacements @ (stiffness @ displacements))
 
         element_displacements = displacements[self.mesh.element_dofs]

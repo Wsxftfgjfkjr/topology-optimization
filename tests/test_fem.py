@@ -287,6 +287,229 @@ def test_free_degrees_of_freedom_complement_the_restrained_ones():
     assert free.tolist() == [2, 3, 4]
 
 
+def test_free_degrees_of_freedom_are_increasing():
+    """ReducedSystemPlan relies on this, so it is part of the contract."""
+    free = fem.free_degrees_of_freedom(8, np.array([5, 0, 3]))
+
+    assert np.all(np.diff(free) > 0)
+
+
+# --------------------------------------------------------------------------
+# Cached reduced free/free system
+# --------------------------------------------------------------------------
+
+
+def _reference_reduction(stiffness, free_dofs):
+    """The reference reduction, spelled out independently of the plan.
+
+    This is ``v0.1-reference``'s reduction verbatim: convert the assembled
+    matrix to CSR, slice the free rows, slice the free columns, convert back to
+    CSC.  Keeping it here means the cached mapping is checked against a
+    restatement of the reference rather than against itself.
+    """
+    return stiffness.tocsr()[free_dofs, :][:, free_dofs].tocsc()
+
+
+def _cantilever_problem(nelx, nely):
+    """A mesh with a restrained edge, so that the reduction actually drops rows.
+
+    Restating ``examples/cantilever.py`` would drag in Matplotlib; only the
+    shape of the boundary condition matters here.
+    """
+    mesh = fem.Mesh(nelx, nely)
+    left_edge = mesh.node_index(0, np.arange(nely + 1))
+    fixed_dofs = np.concatenate([2 * left_edge, 2 * left_edge + 1])
+    loads = np.zeros(mesh.n_dofs)
+    loads[2 * mesh.node_index(nelx, nely // 2) + 1] = -1.0
+    return mesh, fixed_dofs, loads, fem.free_degrees_of_freedom(mesh.n_dofs, fixed_dofs)
+
+
+def _assemble(mesh, moduli):
+    return fem.assemble_stiffness_matrix(
+        mesh, fem.element_stiffness_matrix(YOUNGS, POISSON), moduli
+    )
+
+
+@pytest.mark.parametrize("nelx,nely", [(6, 5), (12, 4), (20, 7)])
+def test_reduced_system_matches_the_reference_slicing_bit_for_bit(nelx, nely):
+    """The cached mapping must not change the reduced matrix at all.
+
+    No sum is reordered by the selection, so every array -- structure included
+    -- has to survive exactly.
+    """
+    mesh, _, _, free_dofs = _cantilever_problem(nelx, nely)
+    stiffness = _assemble(mesh, _moduli(mesh))
+    plan = fem.ReducedSystemPlan(mesh.assembly_plan, free_dofs)
+
+    reduced = plan.reduce(stiffness)
+    reference = _reference_reduction(stiffness, free_dofs)
+
+    assert reduced.format == "csc"
+    assert reduced.shape == reference.shape
+    assert reduced.shape == plan.shape
+    assert reduced.shape == (free_dofs.size, free_dofs.size)
+    assert reduced.nnz == reference.nnz
+    assert np.array_equal(reduced.indptr, reference.indptr)
+    assert np.array_equal(reduced.indices, reference.indices)
+    assert np.array_equal(reduced.data, reference.data)
+
+
+@pytest.mark.parametrize("nelx,nely", [(6, 5), (20, 7)])
+def test_reduced_system_is_bit_exact_across_unrelated_moduli(nelx, nely):
+    """One plan must serve every value field, not just the one it was built on."""
+    mesh, _, _, free_dofs = _cantilever_problem(nelx, nely)
+    plan = fem.ReducedSystemPlan(mesh.assembly_plan, free_dofs)
+    rng = np.random.default_rng(11)
+
+    for moduli in (
+        np.ones(mesh.n_elements),
+        _moduli(mesh),
+        rng.random(mesh.n_elements) + 1e-3,
+    ):
+        stiffness = _assemble(mesh, moduli)
+        reduced = plan.reduce(stiffness)
+        reference = _reference_reduction(stiffness, free_dofs)
+        assert np.array_equal(reduced.data, reference.data)
+        assert np.array_equal(reduced.indptr, reference.indptr)
+        assert np.array_equal(reduced.indices, reference.indices)
+
+
+def test_reduced_system_keeps_exactly_the_entries_with_both_ends_free():
+    """The defining property of the mapping, checked against a direct count."""
+    mesh, _, _, free_dofs = _cantilever_problem(9, 6)
+    stiffness = _assemble(mesh, _moduli(mesh))
+    plan = fem.ReducedSystemPlan(mesh.assembly_plan, free_dofs)
+
+    is_free = np.zeros(mesh.n_dofs, dtype=bool)
+    is_free[free_dofs] = True
+    column_of_entry = np.repeat(np.arange(mesh.n_dofs), np.diff(stiffness.indptr))
+    expected_nnz = int(np.count_nonzero(is_free[stiffness.indices] & is_free[column_of_entry]))
+
+    assert expected_nnz == plan.nnz
+    assert 0 < plan.nnz < stiffness.nnz
+    assert np.array_equal(
+        np.unique(plan.indices), np.arange(free_dofs.size, dtype=plan.indices.dtype)
+    )
+
+
+def test_reduced_system_structure_is_a_canonical_csc_matrix():
+    mesh, _, _, free_dofs = _cantilever_problem(9, 6)
+    plan = fem.ReducedSystemPlan(mesh.assembly_plan, free_dofs)
+    reduced = plan.reduce(_assemble(mesh, _moduli(mesh)))
+
+    assert reduced.has_canonical_format
+    assert reduced.indptr[0] == 0
+    assert reduced.indptr[-1] == plan.nnz == plan.indices.size
+    assert np.all(np.diff(reduced.indptr) >= 0)
+
+    # Ascending row indices inside every column, and no repeated (row, column).
+    for column in range(reduced.shape[1]):
+        rows = reduced.indices[reduced.indptr[column]:reduced.indptr[column + 1]]
+        assert np.all(np.diff(rows) > 0)
+
+
+def test_reduced_system_reuses_one_structure_for_every_field():
+    """One plan serves every field: its structural arrays are never rebuilt."""
+    mesh, _, _, free_dofs = _cantilever_problem(9, 6)
+    plan = fem.ReducedSystemPlan(mesh.assembly_plan, free_dofs)
+    indices, indptr = plan.indices, plan.indptr
+
+    first = plan.reduce(_assemble(mesh, np.ones(mesh.n_elements)))
+    second = plan.reduce(_assemble(mesh, _moduli(mesh)))
+
+    # Same array objects, untouched by either reduction, reused by both.
+    assert plan.indices is indices and plan.indptr is indptr
+    for reduced in (first, second):
+        assert np.array_equal(reduced.indices, indices)
+        assert np.array_equal(reduced.indptr, indptr)
+    assert not np.array_equal(first.data, second.data)
+
+
+def test_reduced_system_plan_can_be_built_from_a_matrix():
+    """The structure argument is duck-typed: an assembled matrix works too."""
+    mesh, _, _, free_dofs = _cantilever_problem(9, 6)
+    stiffness = _assemble(mesh, _moduli(mesh))
+
+    from_matrix = fem.ReducedSystemPlan(stiffness, free_dofs)
+    from_plan = fem.ReducedSystemPlan(mesh.assembly_plan, free_dofs)
+
+    assert from_matrix.shape == from_plan.shape
+    assert np.array_equal(from_matrix.indptr, from_plan.indptr)
+    assert np.array_equal(from_matrix.indices, from_plan.indices)
+    assert np.array_equal(from_matrix.reduce(stiffness).data, from_plan.reduce(stiffness).data)
+
+
+def test_reduced_system_rejects_a_matrix_with_a_different_structure():
+    """Same shape and same nnz, different sparsity: the entries would be scrambled."""
+    mesh, _, _, free_dofs = _cantilever_problem(6, 5)
+    other = fem.Mesh(5, 6)
+    assert other.n_dofs == mesh.n_dofs
+    assert other.assembly_plan.nnz == mesh.assembly_plan.nnz
+
+    plan = fem.ReducedSystemPlan(mesh.assembly_plan, free_dofs)
+    foreign = _assemble(other, np.ones(other.n_elements))
+
+    with pytest.raises(ValueError, match="indptr|indices"):
+        plan.reduce(foreign)
+
+
+def test_reduced_system_rejects_a_matrix_of_the_wrong_size():
+    mesh, _, _, free_dofs = _cantilever_problem(6, 5)
+    plan = fem.ReducedSystemPlan(mesh.assembly_plan, free_dofs)
+    smaller = _assemble(fem.Mesh(4, 3), np.ones(12))
+
+    with pytest.raises(ValueError, match="expected a"):
+        plan.reduce(smaller)
+
+
+def test_reduced_system_rejects_a_non_square_structure():
+    mesh = fem.Mesh(6, 5)
+    rectangular = sparse.csc_matrix(np.ones((mesh.n_dofs, 4)))
+
+    with pytest.raises(ValueError, match="square"):
+        fem.ReducedSystemPlan(rectangular, np.arange(4))
+
+
+def test_reduced_system_rejects_a_non_csc_matrix():
+    """A CSR matrix has the same structure but a different data order."""
+    mesh, _, _, free_dofs = _cantilever_problem(6, 5)
+    plan = fem.ReducedSystemPlan(mesh.assembly_plan, free_dofs)
+
+    with pytest.raises(ValueError, match="CSC"):
+        plan.reduce(_assemble(mesh, np.ones(mesh.n_elements)).tocsr())
+
+
+@pytest.mark.parametrize(
+    "free_dofs",
+    [
+        [0, 5, 3],           # not increasing
+        [0, 1, 1, 2],        # repeated
+        [0, 1, -1],          # out of range
+        [0, 1, 999999],      # out of range
+    ],
+)
+def test_reduced_system_rejects_an_invalid_free_dof_set(free_dofs):
+    mesh = fem.Mesh(6, 5)
+
+    with pytest.raises(ValueError):
+        fem.ReducedSystemPlan(mesh.assembly_plan, free_dofs)
+
+
+def test_solve_displacements_with_a_plan_matches_the_plan_free_path():
+    """Passing the cached plan must not change the solved displacements."""
+    mesh, _, loads, free_dofs = _cantilever_problem(12, 4)
+    stiffness = _assemble(mesh, _moduli(mesh))
+    plan = fem.ReducedSystemPlan(mesh.assembly_plan, free_dofs)
+
+    with_plan = fem.solve_displacements(stiffness, loads, free_dofs, plan)
+    without_plan = fem.solve_displacements(stiffness, loads, free_dofs)
+
+    assert np.array_equal(with_plan, without_plan)
+    # Restrained DOFs stay exactly zero, and the load is actually carried.
+    assert np.count_nonzero(with_plan[~np.isin(np.arange(mesh.n_dofs), free_dofs)]) == 0
+    assert np.any(with_plan[free_dofs] != 0.0)
+
+
 def _uniform_stress_loads(mesh, sigma_xx, sigma_yy):
     """Consistent nodal loads for a uniform stress state.
 
