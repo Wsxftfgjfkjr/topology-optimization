@@ -316,17 +316,19 @@ import path, so no additional configuration is needed.
 ## Running the benchmarks
 
 ```bash
-# Write to a scratch directory. Never point a plain run at the tracked results.
 python benchmarks/benchmark.py --label my-experiment --output-dir /tmp/bench-out
 ```
 
-> **`--label` defaults to `reference`.** Running `python benchmarks/benchmark.py`
-> with no arguments overwrites the frozen baseline `benchmarks/results/reference.csv`
-> and `reference_stages.csv`. Always pass `--label` and, if you do not intend to
-> add a tracked artifact, `--output-dir`.
+> **Existing results are never replaced by default.** A run writes
+> `<label>.csv`, `<label>_stages.csv` and `environment.json` into its output
+> directory, and refuses to start — before measuring anything — if that label's
+> artifacts are already there. The message names the conflicting paths and the
+> three ways out: a different `--label`, a different `--output-dir`, or
+> `--overwrite`.
 
-Every run also writes `environment.json` into the output directory, so
-`--output-dir` is what keeps the tracked metadata untouched.
+Because `--label` defaults to `reference`, that refusal is what protects the
+frozen baseline: a bare `python benchmarks/benchmark.py` stops and reports the
+conflict instead of replacing `benchmarks/results/reference.csv`.
 
 Useful flags:
 
@@ -336,6 +338,8 @@ python benchmarks/benchmark.py --cases 60x20 120x40 --label subset \
     --output-dir /tmp/bench-out
 python benchmarks/benchmark.py --cases 60x20 --repetitions 1 --warmups 0 \
     --label quick --output-dir /tmp/bench-out                # fast pass
+python benchmarks/benchmark.py --label quick --overwrite \
+    --output-dir /tmp/bench-out                              # replace a label
 python benchmarks/benchmark.py --in-process --label debug \
     --output-dir /tmp/bench-out                              # memory unreliable
 ```

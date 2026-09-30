@@ -719,6 +719,64 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def result_paths(output_dir, label):
+    """The artifacts one benchmark run writes, split by scope.
+
+    Returns ``(label_paths, shared_paths)``.  The label-scoped CSVs are named
+    after the label, so an existing one means this run would replace that
+    label's results.  ``environment.json`` carries no label and is rewritten by
+    every run in a directory by design, which is why it is tracked separately:
+    it is part of what a run replaces, but it is not on its own a collision.
+    """
+    output_dir = Path(output_dir)
+    label_paths = (
+        output_dir / f"{label}.csv",
+        output_dir / f"{label}_stages.csv",
+    )
+    shared_paths = (output_dir / "environment.json",)
+    return label_paths, shared_paths
+
+
+def refuse_overwrite(label_paths, shared_paths, overwrite):
+    """Stop before measuring anything if this run would replace a result.
+
+    A bare ``python benchmarks/benchmark.py`` uses the default ``reference``
+    label, whose artifacts are the frozen baseline.  Refusing by default turns
+    replacing an existing result into a deliberate act (``--overwrite``) rather
+    than something a mistyped command does quietly.
+
+    Only the label-scoped artifacts can trigger a refusal.  Blocking on the
+    shared ``environment.json`` would mean that adding a *second* label to an
+    existing results directory needed ``--overwrite`` even though no result
+    would be lost, so it is reported as something the run replaces without
+    being a reason to stop.  The check runs before any case is measured, so a
+    collision costs nothing but the time to read the message, and nothing is
+    ever renamed to dodge one -- a caller who wants a different name passes a
+    different ``--label``.
+    """
+    if overwrite:
+        return
+
+    collisions = [path for path in label_paths if path.exists()]
+    if not collisions:
+        return
+
+    replaced = collisions + [path for path in shared_paths if path.exists()]
+    noun = "file" if len(replaced) == 1 else "files"
+    listed = "\n".join(f"  {path}" for path in replaced)
+    raise SystemExit(
+        f"error: refusing to overwrite {len(replaced)} existing result {noun}:\n"
+        f"{listed}\n"
+        "\n"
+        "Nothing was measured and no file was written.\n"
+        "\n"
+        "To resolve this, either:\n"
+        "  - choose another label:    --label <new-label>\n"
+        "  - choose another output:   --output-dir <directory>\n"
+        f"  - or replace the {noun} above on purpose: --overwrite\n"
+    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Benchmark the topoopt reference solver.",
@@ -733,6 +791,8 @@ def main(argv=None):
     parser.add_argument("--label", default=DEFAULT_LABEL,
                         help="output stem, e.g. 'optimized' for a later build")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--overwrite", action="store_true",
+                        help="replace existing result files instead of refusing to run")
     parser.add_argument("--in-process", action="store_true",
                         help="debug only: skip subprocesses (memory readings become unreliable)")
     parser.add_argument("--list-cases", action="store_true",
@@ -763,6 +823,17 @@ def main(argv=None):
                   f"{mesh.n_nodes:>10} {mesh.n_dofs:>10}")
         return 0
 
+    # Refuse before measuring anything: the check is only useful ahead of the
+    # run, since afterwards the baseline it protects has already been replaced.
+    # Only the label-scoped artifacts can refuse; the shared environment.json is
+    # reported among the files the run replaces, but does not on its own block a
+    # new label written into a directory that already has one.
+    output_dir = Path(args.output_dir)
+    label_paths, shared_paths = result_paths(output_dir, args.label)
+    refuse_overwrite(label_paths, shared_paths, args.overwrite)
+    case_path, stage_path = label_paths
+    (environment_path,) = shared_paths
+
     _assert_problem_equivalence(cases)
 
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -790,11 +861,6 @@ def main(argv=None):
         status = "converged" if row["converged"] else "hit iteration cap"
         print(f" {row['iterations']} iters, {status}, "
               f"compliance {row['final_compliance']:.6e}, {elapsed:.1f}s")
-
-    output_dir = Path(args.output_dir)
-    case_path = output_dir / f"{args.label}.csv"
-    stage_path = output_dir / f"{args.label}_stages.csv"
-    environment_path = output_dir / "environment.json"
 
     write_csv(case_path, case_rows)
     write_csv(stage_path, stage_rows)

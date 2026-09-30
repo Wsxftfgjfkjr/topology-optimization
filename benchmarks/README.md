@@ -9,15 +9,41 @@ every stage measurement is obtained by wrapping existing callables from the outs
 ## Quick start
 
 ```bash
-python benchmarks/benchmark.py                          # 60x20, 120x40, 240x80
-python benchmarks/benchmark.py --cases 60x20 480x160
-python benchmarks/benchmark.py --repetitions 1 --warmups 0     # fast pass
-python benchmarks/benchmark.py --label optimized        # writes optimized.csv
-python benchmarks/benchmark.py --list-cases
+python benchmarks/benchmark.py --list-cases              # sizes, without running
+python benchmarks/benchmark.py --cases 60x20 480x160 --output-dir /tmp/bench
+python benchmarks/benchmark.py --repetitions 1 --warmups 0 --output-dir /tmp/bench
+python benchmarks/benchmark.py --label optimized --output-dir /tmp/bench
+python benchmarks/benchmark.py --label reference --overwrite   # replace the baseline
 ```
 
-Results land in `benchmarks/results/`. The run takes roughly 90 seconds on the reference
-machine (see *Cost* below).
+Results land in the output directory, `benchmarks/results/` by default. A run takes
+roughly 90 seconds on the reference machine (see *Cost* below).
+
+## Overwrite protection
+
+**A run refuses to start if it would replace an existing result**, and says which
+files are in the way. Nothing is measured before that check, and nothing is ever
+renamed to dodge a collision: a different name means a different `--label`.
+
+Because `--label` defaults to `reference`, this is what protects the frozen
+baseline. `python benchmarks/benchmark.py` with no arguments now stops with a
+message instead of replacing `reference.csv`, `reference_stages.csv` and
+`environment.json`.
+
+Three ways out, all named in the message:
+
+| Option | Effect |
+|---|---|
+| `--label <new-label>` | write a different label's artifacts |
+| `--output-dir <dir>` | write into a different directory |
+| `--overwrite` | replace the files that are in the way, deliberately |
+
+The check covers the two label-scoped artifacts, `<label>.csv` and
+`<label>_stages.csv`. `environment.json` carries no label and is rewritten by
+every run in a directory by design, so it is *reported* as something the run
+replaces but does not on its own block a run — otherwise adding a second label to
+an existing results directory would demand `--overwrite` even though no result
+would be lost.
 
 ## What is measured
 
@@ -204,6 +230,11 @@ Produce a second label and compare numerically, **not** bit-for-bit:
 python benchmarks/benchmark.py --label optimized
 ```
 
+A label that does not exist yet collides with nothing, so this needs no
+`--overwrite` even though the run replaces the shared `environment.json`. Copy
+that file to `<label>_environment.json` afterwards if the run's metadata is worth
+keeping alongside the CSVs.
+
 Compare `optimized.csv` against `reference.csv` per case:
 
 | column | suggested check | rationale |
@@ -271,10 +302,25 @@ benchmarks/
     benchmark.py                  # parent + worker
     README.md
     results/
-        reference.csv             # baseline metrics, one row per case
-        reference_stages.csv      # stage partition, one row per (case, stage)
-        environment.json          # environment + methodology metadata
+        <label>.csv               # metrics, one row per case
+        <label>_stages.csv        # stage partition, one row per (case, stage)
+        environment.json          # environment + methodology for a single run
+        <label>_environment.json  # a kept copy of environment.json, per label
 ```
+
+Four labels are tracked:
+
+| label | the build it measures |
+|---|---|
+| `reference` | the frozen `v0.1-reference` baseline |
+| `optimized_assembly` | Experiment 1, cached assembly structure |
+| `optimized_reduced` | Experiment 2, cached reduced-system extraction |
+| `optimized_ordering` | Experiment 3B, SuperLU fill-reducing ordering |
+
+A run writes only `environment.json`, and every run in a directory rewrites it, so
+that file describes the most recent run alone. `<label>_environment.json` is a copy
+kept beside the label whose run produced it; `reference` has no such copy because
+`environment.json` still holds its run.
 
 Generated artefacts are reproducible from `benchmark.py`; nothing here is a profiling
 dump.
