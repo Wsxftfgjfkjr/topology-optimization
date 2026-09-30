@@ -1,115 +1,298 @@
 # Topology Optimization
 
-A lightweight 2D structural topology optimization platform focused on numerical
-algorithms, software engineering, and performance optimization.
+A lightweight 2D structural topology optimization platform focused on **numerical
+algorithms**, **software architecture** and **performance engineering**.
 
-## Purpose
+It solves the classic minimum-compliance cantilever with density-based (SIMP)
+topology optimization on a structured Q4 mesh: finite element analysis, analytical
+sensitivities, sensitivity filtering, and an Optimality Criteria design update,
+wrapped in a benchmark harness that measures the result reproducibly.
 
-The goal is a small, readable, and correct implementation of density-based
-topology optimization that can serve as a **reference baseline**. A later phase
-will add optimized implementations that are measured against this one, so this
-version deliberately favors clarity over speed: every step is written out
-explicitly rather than compressed.
+This is a study-scale implementation, not a commercial CAE package. It handles one
+problem family on one mesh topology, and it is deliberately small enough to read
+end to end.
 
-## V0.1 scope
+## What this project demonstrates
 
-This milestone implements a single classic problem: **minimum-compliance
-topology optimization of a 2D cantilever** on a structured quadrilateral mesh.
+| Area | Evidence |
+|---|---|
+| Numerical methods | Q4 plane-stress FEA, SIMP interpolation, self-adjoint compliance sensitivities, cone filter, Optimality Criteria |
+| Verification | Closed-form element energies, a constant-strain patch test, a beam-theory sanity check, filter and OC properties, and bit-exact cross-checks against a reference assembly path |
+| Performance engineering | A frozen baseline, an instrumented stage partition, and three controlled experiments — each measured, each checked for numerical equivalence |
+| Engineering judgment | An iterative-solver replacement was investigated and **rejected on evidence**; a direct-solver ordering change was adopted instead |
 
-In scope:
+The performance work reduced end-to-end runtime by **1.26× to 1.88×** across the
+canonical meshes, and cut solver memory by 12% at the largest case. Details and
+negative results are in [`docs/performance.md`](docs/performance.md).
 
-- structured rectangular mesh, 4-node (Q4) plane-stress elements, 2 DOF per node
-- linear elastic material, SIMP density interpolation
+## Capabilities
+
+- structured rectangular 2D mesh, 4-node (Q4) plane-stress elements, 2 DOF per node
+- sparse global stiffness assembly in CSC format, with cached sparsity structure
+- linear elastic material with SIMP density interpolation
 - compliance minimization under a volume-fraction constraint
-- analytical compliance sensitivities
-- sensitivity filtering to suppress checkerboarding
-- Optimality Criteria (OC) density update
-- convergence on the maximum density change
-- sparse assembly and a sparse direct linear solver
+- analytical compliance sensitivities (the problem is self-adjoint)
+- cone-weighted sensitivity filtering to suppress checkerboarding
+- Optimality Criteria density update with a bisection volume multiplier
+- convergence tracking on the maximum density change
+- CLI execution, topology and convergence plots, CSV iteration history
+- pytest numerical validation, including regression tests for the performance work
+- reproducible benchmark harness with stage-level instrumentation and peak-RSS capture
 
-Deliberately out of scope for now: 3D, unstructured or arbitrary meshes, multiple
-load cases, additional physics (thermal, buckling, stress constraints), and the
-FastAPI/Docker/database/async scaffolding that a hosted service would need.
+Deliberately **not** implemented: 3D, unstructured meshes, multiple load cases, and
+other physics (thermal, buckling, stress constraints). Also absent is the
+API/Docker/database scaffolding a hosted service would need.
+
+## Architecture
+
+Data flow through one optimization iteration. Everything except the CLI and the
+benchmark harness is in the `topoopt` package.
+
+```mermaid
+flowchart TD
+    CLI["CLI and configuration<br/>examples/cantilever.py"] --> MESH["Mesh and DOF mapping<br/>fem.Mesh"]
+    MESH --> OPT["Topology optimizer<br/>optimizer.TopologyOptimizer"]
+    OPT --> SIMP["SIMP material interpolation<br/>optimizer.element_moduli"]
+    SIMP --> ASM["Sparse global stiffness assembly<br/>fem.StiffnessAssemblyPlan.assemble"]
+    ASM --> SOLVE["Reduced system and sparse direct solve<br/>fem.ReducedSystemPlan.reduce<br/>fem.solve_displacements"]
+    SOLVE --> COMP["Compliance and element strain energy<br/>optimizer.analyze"]
+    COMP --> SENS["Analytical sensitivities<br/>optimizer.compliance_sensitivity"]
+    SENS --> FILT["Sensitivity filter<br/>filter.filter_sensitivities"]
+    FILT --> OC["Optimality Criteria update<br/>optimizer.optimality_criteria_update"]
+    OC --> CONV{"Converged?"}
+    CONV -->|no| SIMP
+    CONV -->|yes| OUT["Density field, iteration history,<br/>CSV and plots"]
+```
+
+Two structures are built once and reused for the whole run, because the mesh and
+the boundary conditions fix them and only the density changes:
+
+- `fem.StiffnessAssemblyPlan` — the CSC sparsity pattern and the scatter map from
+  element entries to global slots
+- `fem.ReducedSystemPlan` — which global entries survive the elimination of the
+  restrained degrees of freedom, and the reduced CSC structure
 
 ## Numerical method
 
-The optimizer solves
+### 1. Problem statement
 
-```
-minimize    c(x) = Uᵀ K(x) U
-subject to  K(x) U = F
-            Σ xₑ / nₑ ≤ volfrac
-            x_min ≤ xₑ ≤ 1
-```
+The optimizer solves the minimum-compliance problem
 
-1. **Discretization.** The domain is a regular grid of `nelx × nely` bilinear
-   quadrilaterals of unit edge length, so the design domain is
-   `[0, nelx] × [0, nely]`. Nodes are numbered row-major with the x index
-   fastest; each element's four nodes are ordered counter-clockwise from its
-   lower-left corner.
+$$
+\begin{aligned}
+\min_{\mathbf{x}} \quad & c(\mathbf{x}) = \mathbf{u}^{\mathsf{T}} \mathbf{K}(\mathbf{x}) \, \mathbf{u} \\
+\text{subject to} \quad & \mathbf{K}(\mathbf{x}) \, \mathbf{u} = \mathbf{F} \\
+& \frac{1}{n_e} \sum_{e=1}^{n_e} x_e \le f \\
+& x_{\min} \le x_e \le 1
+\end{aligned}
+$$
 
-2. **Element stiffness.** `Kₑ = ∫ Bᵀ D B dΩ` for the plane-stress constitutive
-   matrix `D`, evaluated with 2×2 Gauss quadrature. The rule is exact here: for
-   a rectangle the integrand is at most quadratic in each natural coordinate.
+where $\mathbf{x} = (x_e)$ collects the element densities of the $n_e$ elements,
+$\mathbf{u}$ is the nodal displacement vector, $\mathbf{K}$ the global stiffness
+matrix, $\mathbf{F}$ the load vector, $f$ the prescribed volume fraction (the
+`volfrac` parameter) and $x_{\min}$ the lower density bound (the `min_density`
+parameter). Element volumes are one on this mesh, so the volume constraint bounds
+the mean density.
 
-3. **Material interpolation (SIMP).** `Eₑ(xₑ) = E_min + xₑ^penal (E₀ − E_min)`,
-   with `E_min = 10⁻⁹ E₀` so the stiffness matrix stays non-singular.
+The domain is a regular grid of `nelx` × `nely` bilinear quadrilaterals of unit
+edge length, so it is `[0, nelx] × [0, nely]`. Nodes are numbered row-major with
+the $x$ index fastest.
 
-4. **Assembly and solve.** The global stiffness matrix is assembled in sparse
-   (COO → CSC) format; the restrained degrees of freedom are eliminated and the
-   reduced system is solved with `scipy.sparse.linalg.spsolve`.
+### 2. Element stiffness
 
-5. **Sensitivities.** For a fixed load the problem is self-adjoint, so
+For element $e$,
 
-   ```
-   ∂c/∂xₑ = −penal · xₑ^(penal−1) · (E₀ − E_min) · uₑᵀ k₀ uₑ
-   ```
+$$
+\mathbf{K}_e = \int_{\Omega_e} \mathbf{B}^{\mathsf{T}}\mathbf{D}\mathbf{B}\,\mathrm{d}\Omega
+$$
 
-   where `k₀` is the unit-modulus element stiffness matrix. Note that `c` equals
-   the sum of the element strain energies `Eₑ · uₑᵀ k₀ uₑ`, which the test suite
-   checks directly.
+with $\mathbf{D}$ the plane-stress constitutive matrix, integrated with 2×2 Gauss
+quadrature. The rule is exact here: on a rectangle the integrand is at most
+quadratic in each natural coordinate.
 
-6. **Sensitivity filter.** Raw element sensitivities are replaced by a cone
-   weighted average of their neighbourhood,
+### 3. Material interpolation (SIMP)
 
-   ```
-   ∂̃c/∂xₑ = Σ_f H[e,f] · x_f · ∂c/∂x_f / ( xₑ · Σ_f H[e,f] )
-   H[e,f] = max(0, rmin − ‖cₑ − c_f‖)
-   ```
+$$
+E_e(x_e) = E_{\min} + x_e^{p} \left( E_0 - E_{\min} \right)
+$$
 
-   where `rmin` is measured in **element units**, so it does not correspond to a
-   fixed physical length if the mesh is refined without changing it. This is the
-   Sigmund–Petersson filter in its sensitivity form; it leaves the finite element
-   analysis untouched. `rmin ≤ 1` has no effect, since no neighbour lies inside
-   the cone.
+where $p$ is the penalty exponent (the `penal` parameter), $E_0$ the solid modulus
+and $E_{\min}$ the void modulus. Their ratio $E_{\min} / E_0$ is the
+`void_modulus_ratio` parameter, set to $10^{-9}$ so the stiffness matrix stays
+non-singular.
 
-7. **Design update.** Optimality Criteria: stationarity of the Lagrangian gives
-   `xₑ ← xₑ √(−∂̃c/∂xₑ / λ)`, clipped to the move limit and to
-   `[x_min, 1]`, with the volume-constraint multiplier `λ` found by bisection.
+### 4. Assembly and equilibrium
 
-8. **Convergence.** The loop stops when `max|x_new − x|` falls below the
-   tolerance, or at the iteration cap.
+The global stiffness matrix is assembled in CSC format and the restrained degrees
+of freedom are eliminated, leaving the reduced equilibrium system
 
-## Installation
+$$
+\mathbf{K}_{ff} \, \mathbf{u}_f = \mathbf{F}_f
+$$
 
-Python 3.10 or newer. The only runtime dependencies are NumPy, SciPy and
-Matplotlib; pytest is needed for the test suite.
+over the free degrees of freedom. It is solved with
+`scipy.sparse.linalg.spsolve` (SuperLU) using a fill-reducing column ordering.
+
+### 5. Sensitivities
+
+For a fixed load the problem is self-adjoint, so
+
+$$
+\frac{\partial c}{\partial x_e} = -p \, x_e^{p-1} \left( E_0 - E_{\min} \right) \mathbf{u}_e^{\mathsf{T}} \mathbf{k}_0 \, \mathbf{u}_e
+$$
+
+where $\mathbf{u}_e$ is the element displacement vector and $\mathbf{k}_0$ the
+unit-modulus element stiffness matrix. The compliance equals the sum of the
+element strain energies, which the test suite checks directly.
+
+### 6. Sensitivity filter
+
+Raw element sensitivities are replaced by a cone weighted average over the
+neighbourhood,
+
+$$
+\frac{\partial \tilde{c}}{\partial x_e} = \frac{\sum_f H_{ef} \, x_f \, \dfrac{\partial c}{\partial x_f}}{x_e \sum_f H_{ef}},
+\qquad
+H_{ef} = \max\left( 0, \; r_{\min} - \lVert \mathbf{y}_e - \mathbf{y}_f \rVert \right)
+$$
+
+where $\mathbf{y}_e$ is the centroid of element $e$ and $r_{\min}$ the filter
+radius (the `rmin` parameter). This is the Sigmund–Petersson filter in its
+sensitivity form; it leaves the finite element analysis untouched. `rmin` is
+measured in **element units**, so it is not a fixed physical length when the mesh
+is refined, and $r_{\min} \le 1$ has no effect, since no neighbour lies inside the
+cone.
+
+### 7. Design update
+
+Optimality Criteria: stationarity of the Lagrangian gives
+
+$$
+B_e = x_e \sqrt{-\frac{1}{\lambda} \frac{\partial \tilde{c}}{\partial x_e}},
+\qquad
+x_e \leftarrow \mathrm{clip}_{[x_{\min}, \, 1]} \left( \mathrm{clip}_{[x_e - m, \, x_e + m]} \left( B_e \right) \right)
+$$
+
+with $\lambda$ the volume-constraint multiplier found by bisection and $m$ the
+move limit (the `move` parameter).
+
+### 8. Convergence
+
+The loop stops when
+
+$$
+\max_e \left| x_e^{(k+1)} - x_e^{(k)} \right| < \tau
+$$
+
+or at the iteration cap, where $k$ indexes the iteration and $\tau$ is the
+convergence tolerance (the `tolerance` parameter, exposed as `--tol`).
+
+The implementation lives in [`topoopt/fem.py`](topoopt/fem.py),
+[`topoopt/filter.py`](topoopt/filter.py) and
+[`topoopt/optimizer.py`](topoopt/optimizer.py).
+
+## Validation
+
+The test suite checks the numerical building blocks individually, not only the
+end-to-end run:
+
+- **Element level** — constitutive matrix symmetry and positive definiteness, the
+  element stiffness matrix's symmetry, positive semi-definiteness and three
+  rigid-body null modes, and its strain energy against the closed-form
+  constitutive law for uniaxial and shear strain. A square element's stiffness is
+  also checked to be independent of element size.
+- **Mesh and DOF mapping** — row-major node numbering, element DOF ordering,
+  and the property that element DOFs cover every global DOF exactly once.
+- **System level** — global stiffness symmetry and annihilation of rigid
+  translation, scaling with the element moduli, and a **constant-strain patch
+  test** with analytical consistent nodal loads, which the element space
+  reproduces to machine precision.
+- **Assembly and reduction** — the cached assembly and the cached reduced-system
+  extraction are compared **bit-for-bit** against the explicit reference paths,
+  and the reduced-system plan is checked to reject structures it does not match.
+- **Physics sanity check** — a solid slender cantilever's compliance is compared
+  against Timoshenko beam theory with a shear correction factor. A
+  displacement-based finite element model is stiffer than the exact solution, so
+  the computed compliance is asserted to sit just below the beam estimate (within
+  3%). This is a sanity check on one slender mesh, not a reference solution.
+- **Filter** — kernel weights and symmetry, row sums, radius cutoff, preservation
+  of a uniform field, spreading of a point sensitivity, and finiteness at the
+  density lower bound.
+- **Optimizer** — OC bounds and move limit, the volume constraint, compliance
+  equalling the summed element strain energies, non-positive sensitivities, and a
+  small cantilever smoke test that the loop converges to a finite improved design.
+- **Performance regressions** — the assembly and reduced-system caches are held to
+  bit-exact equivalence with the paths they replaced, and the SuperLU ordering
+  change is held to numerical equivalence with a documented tolerance.
+
+No comparison against commercial finite element software has been performed, and
+no such claim is made.
+
+## Performance
+
+Measured on the three canonical meshes with the benchmark harness. Runtime is
+**machine-dependent** — compare ratios measured on the same host, not absolute
+seconds across machines.
+
+| Mesh | Elements | DOFs | Iterations | `v0.1-reference` | `v0.3-performance` | Cumulative speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| 60×20 | 1 200 | 2 562 | 44 | 0.183 s | 0.145 s | **1.26×** |
+| 120×40 | 4 800 | 9 922 | 61 | 2.362 s | 1.260 s | **1.88×** |
+| 240×80 | 19 200 | 39 042 | 76 | 15.526 s | 9.922 s | **1.56×** |
+
+Times are the mean of three clean runs of `TopologyOptimizer.run()`, after one
+discarded warm-up. All three cases converge in every build, to the same iteration
+count (44 / 61 / 76) and to the same design to within 4e-11 relative.
+
+Benchmark environment: CPython 3.12.14, NumPy 2.5.3, SciPy 1.18.1, Darwin 25.5.0
+on `arm64` (Apple Silicon, `hw.model` Mac17,3), 10 CPUs, BLAS thread environment
+variables unset. Recorded in
+[`benchmarks/results/optimized_ordering_environment.json`](benchmarks/results/optimized_ordering_environment.json).
+
+The work proceeded in three measured steps:
+
+1. **Sparse assembly structure caching** — the sparsity pattern and scatter map
+   are invariant across iterations, so they are computed once. Assembly dropped
+   4.4–5.2×, which was worth 1.03–1.10× end to end.
+2. **Reduced-system extraction caching** — the free/free entry selection is
+   likewise fixed by the mesh and the boundary conditions. `solve_reduce` dropped
+   ~7×, worth 1.01–1.05× end to end.
+3. **SuperLU fill-reducing ordering** — selecting `MMD_AT_PLUS_A`, a
+   minimum-degree ordering on a symmetric structure, in place of the default
+   `COLAMD`. `solve_numeric` improved 1.11–1.82×, worth 1.09–1.76× end to end,
+   and peak solver memory fell at the larger meshes.
+
+The first two steps produced large *local* wins and small *end-to-end* wins,
+because the sparse solve was never their bottleneck and its share grows with mesh
+size. The third step targeted that bottleneck directly. The three are
+independent and compose multiplicatively; see
+[`docs/performance.md`](docs/performance.md) for the per-stage breakdown, the
+memory progression, and the iterative-solver investigation that was rejected.
+
+## Quick start
+
+Python 3.10 or newer. Runtime dependencies are NumPy, SciPy and Matplotlib.
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
-## Running the cantilever example
+For the test suite, install the development extra:
+
+```bash
+pip install -e ".[dev]"
+```
+
+Run the canonical cantilever:
 
 ```bash
 python -m examples.cantilever --nelx 60 --nely 20 --volfrac 0.4 --penal 3.0 --rmin 1.5
 ```
 
-The run prints one line per iteration (iteration, compliance, volume fraction,
-maximum density change, and the time for that iteration) and writes three files
-into `results/`:
+It prints one line per iteration (iteration, compliance, volume fraction, maximum
+density change, iteration time) and writes three files into `results/`:
 
 | File | Contents |
 |---|---|
@@ -117,11 +300,9 @@ into `results/`:
 | `convergence.png` | compliance, volume fraction and density change per iteration |
 | `history.csv` | the same per-iteration numbers, for later analysis |
 
-`history.csv` carries the per-iteration compliance, volume fraction, maximum
-density change and wall-clock time, which is the raw material for the
-benchmarking phase. Plotting uses the non-interactive Agg backend, so the
-example runs from a terminal without a display. `--max-iter`, `--tol` and
-`--output-dir` are also available; run with `--help` for the full list.
+`--max-iter`, `--tol` and `--output-dir` are also available; run with `--help`
+for the full list. Plotting uses the non-interactive Agg backend, so the example
+runs from a terminal without a display. `results/` is generated and not tracked.
 
 ## Running the tests
 
@@ -129,15 +310,89 @@ example runs from a terminal without a display. `--max-iter`, `--tol` and
 pytest
 ```
 
-The suite covers the numerical building blocks rather than only the end-to-end
-run: the element stiffness matrix (symmetry, positive semi-definiteness, its
-three rigid-body null modes, and its strain energy against the constitutive law
-for uniaxial and shear strain), mesh and DOF mapping, a constant-strain patch
-test with analytical consistent nodal loads, the filter kernel and filtering
-behaviour, and the OC update's bounds and volume constraint. A small cantilever
-smoke test checks that the full loop finishes and returns finite values.
+`pyproject.toml` points pytest at `tests/` and puts the repository root on the
+import path, so no additional configuration is needed.
 
-## Status
+## Running the benchmarks
 
-V0.1 — reference implementation. Not yet optimized for performance, and not
-validated against commercial finite element software.
+```bash
+# Write to a scratch directory. Never point a plain run at the tracked results.
+python benchmarks/benchmark.py --label my-experiment --output-dir /tmp/bench-out
+```
+
+> **`--label` defaults to `reference`.** Running `python benchmarks/benchmark.py`
+> with no arguments overwrites the frozen baseline `benchmarks/results/reference.csv`
+> and `reference_stages.csv`. Always pass `--label` and, if you do not intend to
+> add a tracked artifact, `--output-dir`.
+
+Every run also writes `environment.json` into the output directory, so
+`--output-dir` is what keeps the tracked metadata untouched.
+
+Useful flags:
+
+```bash
+python benchmarks/benchmark.py --list-cases                  # sizes without running
+python benchmarks/benchmark.py --cases 60x20 120x40 --label subset \
+    --output-dir /tmp/bench-out
+python benchmarks/benchmark.py --cases 60x20 --repetitions 1 --warmups 0 \
+    --label quick --output-dir /tmp/bench-out                # fast pass
+python benchmarks/benchmark.py --in-process --label debug \
+    --output-dir /tmp/bench-out                              # memory unreliable
+```
+
+`--cases` accepts any `NELXxNELY`, including sizes outside the canonical three.
+Larger meshes get expensive quickly — the sparse factorization grows faster than
+the problem, and a `480x160` case needs several GB. `benchmarks/README.md` gives
+the estimate.
+
+Benchmark runtime and memory are machine-dependent, and results vary with CPU, OS,
+SciPy build, thermal state and background load. The tracked numbers above were
+produced with the default methodology (one warm-up, three clean repetitions, one
+subprocess per case). Read [`benchmarks/README.md`](benchmarks/README.md) for the
+methodology and its caveats before comparing builds.
+
+## Project structure
+
+```
+topoopt/
+    fem.py              mesh, element stiffness, sparse assembly, reduced solve
+    filter.py           cone filter kernel and sensitivity filtering
+    optimizer.py        SIMP minimum compliance with an Optimality Criteria update
+examples/
+    cantilever.py       CLI, plotting and CSV history for the canonical problem
+tests/
+    test_fem.py         element, assembly, reduction and solve validation
+    test_filter.py      filter kernel and filtering behaviour
+    test_optimizer.py   OC update, sensitivities, end-to-end smoke tests
+benchmarks/
+    benchmark.py        reproducible harness: parent orchestration and worker
+    README.md           methodology, output schema and measurement caveats
+    results/            tracked benchmark artifacts, four labels
+docs/
+    performance.md      the performance-engineering record
+```
+
+## Limitations and roadmap
+
+**Scope limits.** 2D only, on a structured rectangular mesh, with a single load
+case and linear elastic material. No stress, buckling or thermal constraints. The
+filter radius is expressed in element units, so refining the mesh changes the
+effective physical filter length. Nothing here has been validated against
+commercial finite element software.
+
+**The solver is still the bottleneck.** `solve_numeric` accounts for 83–95% of
+per-iteration time in the current build, and the fitted growth of the sparse
+factorization is roughly `O(n_dofs^1.5)` between the smallest and largest
+canonical mesh — faster than the problem size itself. Peak memory grows the same
+way. The ordering change lowered the constant factor; it did not change the
+exponent.
+
+Directions that would be worth investigating, none of them attempted here:
+
+- alternative sparse direct solvers with better fill or memory behaviour
+- reuse of the symbolic factorization, which is invariant across iterations but
+  not exposed by SciPy's public API
+- stronger iterative preconditioning (multilevel or incomplete factorization),
+  which the simple preconditioners tested so far did not make competitive
+
+These are open questions, not planned work.
