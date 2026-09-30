@@ -38,6 +38,16 @@ import scipy.sparse.linalg as sparse_linalg
 GAUSS_POINTS = np.array([-1.0, 1.0]) / np.sqrt(3.0)
 GAUSS_WEIGHTS = np.array([1.0, 1.0])
 
+# Column ordering SuperLU applies before factorizing the reduced stiffness
+# system.  ``MMD_AT_PLUS_A`` is a minimum-degree ordering computed on the
+# structure of ``A^T + A``, which is the structure of ``A`` itself when ``A``
+# is symmetric -- exactly the case here, since the reduced stiffness matrix is
+# symmetric.  The SuperLU default, ``COLAMD``, is a column ordering aimed at
+# unsymmetric matrices and consequently produces more fill on this system.
+# Fill is what the factorization cost and its memory footprint both scale
+# with, so the choice of ordering is the whole of the effect.
+FILL_REDUCING_ORDERING = "MMD_AT_PLUS_A"
+
 
 def plane_stress_matrix(youngs_modulus, poisson_ratio):
     """Isotropic plane-stress constitutive matrix ``D`` (3 x 3).
@@ -488,7 +498,9 @@ class ReducedSystemPlan:
             raise ValueError("the CSC indices array differs from this plan's structure")
 
 
-def solve_displacements(stiffness, loads, free_dofs, plan=None):
+def solve_displacements(
+    stiffness, loads, free_dofs, plan=None, permc_spec=FILL_REDUCING_ORDERING
+):
     """Solve ``K U = F`` with the restrained degrees of freedom held at zero.
 
     The system is reduced to the free degrees of freedom and solved with
@@ -509,11 +521,19 @@ def solve_displacements(stiffness, loads, free_dofs, plan=None):
         out builds a throwaway plan, which gives the same answer but performs
         more work than the slicing it replaces, so a caller that solves more
         than once should always pass one.
+    permc_spec : str, optional
+        SuperLU column ordering, forwarded to :func:`scipy.sparse.linalg.spsolve`.
+        Defaults to :data:`FILL_REDUCING_ORDERING`; ``None`` selects SuperLU's
+        own default (``COLAMD``).  The ordering changes the order operations are
+        summed in, so results are numerically equivalent rather than
+        bit-identical.
     """
     if plan is None:
         plan = ReducedSystemPlan(stiffness, free_dofs)
 
     displacements = np.zeros(stiffness.shape[0])
     reduced = plan.reduce(stiffness)
-    displacements[free_dofs] = sparse_linalg.spsolve(reduced, loads[free_dofs])
+    displacements[free_dofs] = sparse_linalg.spsolve(
+        reduced, loads[free_dofs], permc_spec=permc_spec
+    )
     return displacements

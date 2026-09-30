@@ -1,5 +1,7 @@
 """Tests for the finite element building blocks."""
 
+import inspect
+
 import numpy as np
 import pytest
 import scipy.sparse as sparse
@@ -508,6 +510,52 @@ def test_solve_displacements_with_a_plan_matches_the_plan_free_path():
     # Restrained DOFs stay exactly zero, and the load is actually carried.
     assert np.count_nonzero(with_plan[~np.isin(np.arange(mesh.n_dofs), free_dofs)]) == 0
     assert np.any(with_plan[free_dofs] != 0.0)
+
+
+@pytest.mark.parametrize("nelx,nely", [(6, 5), (12, 4), (20, 7)])
+def test_ordering_choice_does_not_change_the_solution(nelx, nely):
+    """The SuperLU column ordering is a fill-reducing permutation, not a
+    different solver.
+
+    It reorders the summations inside the factorization, so the two orderings
+    agree only to rounding -- measured at about 1e-12 of the largest
+    displacement on these meshes.  The bound below is deliberately far above
+    that: it is meant to fail on a real change of solver, not on rounding.
+    ``permc_spec=None`` is SuperLU's own default and is exactly the call the
+    solver made before the fill-reducing ordering was selected.
+    """
+    mesh, _, loads, free_dofs = _cantilever_problem(nelx, nely)
+    stiffness = _assemble(mesh, _moduli(mesh))
+    plan = fem.ReducedSystemPlan(mesh.assembly_plan, free_dofs)
+
+    selected = fem.solve_displacements(stiffness, loads, free_dofs, plan)
+    default = fem.solve_displacements(
+        stiffness, loads, free_dofs, plan, permc_spec=None
+    )
+
+    scale = np.abs(default).max()
+    assert scale > 0.0
+    assert np.abs(selected - default).max() <= 1e-9 * scale
+
+    # Both orderings must still satisfy the reduced system, and both must hold
+    # the restrained degrees of freedom at exactly zero.
+    reduced = plan.reduce(stiffness)
+    rhs = loads[free_dofs]
+    restrained = np.setdiff1d(np.arange(mesh.n_dofs), free_dofs)
+    for solution in (selected, default):
+        residual = np.linalg.norm(rhs - reduced @ solution[free_dofs])
+        assert residual <= 1e-10 * np.linalg.norm(rhs)
+        assert np.all(solution[restrained] == 0.0)
+
+
+def test_solve_displacements_defaults_to_the_selected_ordering():
+    """The ordering is a deliberate choice, so the default must forward it.
+
+    Asserting the relationship rather than the ordering's name keeps this test
+    valid if the selected ordering is ever revisited.
+    """
+    default = inspect.signature(fem.solve_displacements).parameters["permc_spec"]
+    assert default.default == fem.FILL_REDUCING_ORDERING
 
 
 def _uniform_stress_loads(mesh, sigma_xx, sigma_yy):
