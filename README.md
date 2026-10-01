@@ -12,6 +12,17 @@ This is a study-scale implementation, not a commercial CAE package. It handles o
 problem family on one mesh topology, and it is deliberately small enough to read
 end to end.
 
+## Example result
+
+![Density field over a 60 by 20 element grid: solid material forms bands along the
+top and bottom edges, with diagonal members bracing between them and meeting at the
+loaded node in the middle of the right edge. A colorbar maps element density from 0
+to 1.](docs/images/cantilever-topology.png)
+
+*The canonical cantilever example: 60 × 20 elements, volume fraction 0.40, SIMP
+penalty $p = 3$ and sensitivity-filter radius $r_{\min} = 1.5$, converged in 44
+iterations.*
+
 ## What this project demonstrates
 
 | Area | Evidence |
@@ -224,6 +235,18 @@ end-to-end run:
 - **Performance regressions** — the assembly and reduced-system caches are held to
   bit-exact equivalence with the paths they replaced, and the SuperLU ordering
   change is held to numerical equivalence with a documented tolerance.
+
+### Convergence example
+
+![Three panels over 44 iterations: compliance falls steeply over the first few
+iterations and then flattens to 2.505e+02; the volume fraction holds on the 0.40
+target line; the maximum density change falls on a logarithmic axis and crosses the
+0.01 tolerance line at the final iteration.](docs/images/cantilever-convergence.png)
+
+*Per-iteration history for the same run. The volume fraction stays at the prescribed
+0.40 throughout, and the loop stops at iteration 44 when the maximum density change
+falls below the $10^{-2}$ tolerance — the stopping criterion defined in
+[step 8](#8-convergence) above.*
 
 No comparison against commercial finite element software has been performed, and
 no such claim is made.
