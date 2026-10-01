@@ -31,11 +31,10 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap  # noqa: E402
 
-from topoopt.fem import Mesh  # noqa: E402
 from topoopt.optimizer import IterationRecord, TopologyOptimizer  # noqa: E402
+from topoopt.problems import build_cantilever  # noqa: E402
 
 DEFAULT_OUTPUT_DIR = Path("results")
-LOAD_MAGNITUDE = 1.0
 
 # Chart chrome and series colours (light surface).
 SURFACE = "#fcfcfb"
@@ -51,24 +50,6 @@ DENSITY_RAMP = (
     "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7", "#3987e5",
     "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b",
 )
-
-
-def build_cantilever(nelx, nely, load=LOAD_MAGNITUDE):
-    """Build the canonical cantilever: fixed left edge, point load on the right.
-
-    Returns the mesh, the restrained degrees of freedom (both components of
-    every node on the left edge) and the nodal load vector (a single downward
-    force at the middle of the right edge).
-    """
-    mesh = Mesh(nelx, nely)
-
-    left_edge = mesh.node_index(0, np.arange(nely + 1))
-    fixed_dofs = np.concatenate([2 * left_edge, 2 * left_edge + 1]).astype(np.intp)
-
-    loads = np.zeros(mesh.n_dofs)
-    loads[2 * mesh.node_index(nelx, nely // 2) + 1] = -load
-
-    return mesh, fixed_dofs, loads
 
 
 def write_history(history, path):

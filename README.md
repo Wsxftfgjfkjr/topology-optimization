@@ -47,12 +47,14 @@ negative results are in [`docs/performance.md`](docs/performance.md).
 - Optimality Criteria density update with a bisection volume multiplier
 - convergence tracking on the maximum density change
 - CLI execution, topology and convergence plots, CSV iteration history
+- a synchronous FastAPI backend that runs the same solver over HTTP
 - pytest numerical validation, including regression tests for the performance work
 - reproducible benchmark harness with stage-level instrumentation and peak-RSS capture
 
 Deliberately **not** implemented: 3D, unstructured meshes, multiple load cases, and
-other physics (thermal, buckling, stress constraints). Also absent is the
-API/Docker/database scaffolding a hosted service would need.
+other physics (thermal, buckling, stress constraints). The HTTP backend is
+synchronous and stateless; absent are the job queues, persistence, authentication
+and container setup a hosted service would need.
 
 ## Architecture
 
@@ -336,6 +338,11 @@ pytest
 `pyproject.toml` points pytest at `tests/` and puts the repository root on the
 import path, so no additional configuration is needed.
 
+The run reports one `StarletteDeprecationWarning` about `httpx`. Starlette's
+`TestClient` now prefers `httpx2` and warns when it falls back to the
+conventional `httpx`; the fallback works, so the suite stays on the ordinary
+FastAPI testing stack rather than adding a second HTTP client.
+
 ## Running the benchmarks
 
 ```bash
@@ -372,6 +379,45 @@ Larger meshes get expensive quickly — the sparse factorization grows faster th
 the problem, and a `480x160` case needs several GB. `benchmarks/README.md` gives
 the estimate.
 
+## Running the API
+
+A small synchronous HTTP backend exposes the same solver. Install its
+dependencies into the same environment:
+
+```bash
+pip install -e ".[api]"
+```
+
+Start it from the repository root:
+
+```bash
+uvicorn api.main:app --reload
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | liveness probe; returns `{"status": "ok"}` |
+| `POST /api/v1/optimize` | run the canonical cantilever and return the density field |
+
+Every field is optional and defaults to the value the example and the benchmark
+suite use, so the canonical run is one request:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/optimize \
+  -H 'Content-Type: application/json' \
+  -d '{"nelx": 60, "nely": 20, "volfrac": 0.4, "penal": 3.0, "rmin": 1.5}'
+```
+
+The response carries the optimized density field as `nely` rows of `nelx` values,
+alongside the convergence history and the final scalars — numbers, not images, so
+a frontend renders the result itself. Interactive documentation is at
+<http://127.0.0.1:8000/docs>, and the raw schema at `/openapi.json`.
+
+The endpoint is synchronous: FastAPI runs it in a worker thread, but it blocks
+until the optimization finishes — about 0.15 s for the default 60×20 mesh. Cost
+grows quickly with mesh size and V1 imposes no upper bound on the mesh
+dimensions, so a very large request will hold a thread for a long time.
+
 Benchmark runtime and memory are machine-dependent, and results vary with CPU, OS,
 SciPy build, thermal state and background load. The tracked numbers above were
 produced with the default methodology (one warm-up, three clean repetitions, one
@@ -385,18 +431,27 @@ topoopt/
     fem.py              mesh, element stiffness, sparse assembly, reduced solve
     filter.py           cone filter kernel and sensitivity filtering
     optimizer.py        SIMP minimum compliance with an Optimality Criteria update
+    problems.py         the canonical cantilever, shared by the CLI, API and benchmarks
 examples/
     cantilever.py       CLI, plotting and CSV history for the canonical problem
+api/
+    main.py             FastAPI application and the two endpoints
+    models.py           request and response models
+    service.py          adapter from a validated request to one core run
 tests/
     test_fem.py         element, assembly, reduction and solve validation
     test_filter.py      filter kernel and filtering behaviour
     test_optimizer.py   OC update, sensitivities, end-to-end smoke tests
+    test_problems.py    the shared problem definition and its import boundary
+    test_benchmark.py   overwrite protection in the benchmark harness
+    test_api.py         endpoints, validation and core equivalence
 benchmarks/
     benchmark.py        reproducible harness: parent orchestration and worker
     README.md           methodology, output schema and measurement caveats
     results/            tracked benchmark artifacts, four labels
 docs/
     performance.md      the performance-engineering record
+    images/             curated example outputs used by this README
 ```
 
 ## Limitations and roadmap
