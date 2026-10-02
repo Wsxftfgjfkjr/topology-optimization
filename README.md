@@ -418,6 +418,41 @@ until the optimization finishes — about 0.15 s for the default 60×20 mesh. Co
 grows quickly with mesh size and V1 imposes no upper bound on the mesh
 dimensions, so a very large request will hold a thread for a long time.
 
+### The web interface
+
+A small React frontend in [`web/`](web) drives that API from the browser: it
+edits the seven parameters, runs the optimization, and draws the density field
+and the convergence history. Run it alongside the backend, in two terminals.
+
+Terminal 1 — the backend:
+
+```bash
+uvicorn api.main:app --reload
+```
+
+Terminal 2 — the frontend:
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Then open <http://localhost:5173>.
+
+The frontend calls the API on a relative path (`/api/v1/optimize`). During
+development the Vite dev server proxies `/api` and `/health` to
+`http://127.0.0.1:8000`, so no CORS configuration is needed on the backend and
+no hostname is baked into the frontend. Point it at a different backend with
+`VITE_BACKEND_URL`, or set `VITE_API_BASE` to serve the built assets from
+somewhere else.
+
+```bash
+cd web
+npm run build      # type-check, then bundle into web/dist
+npm test           # component tests, no backend required
+```
+
 Benchmark runtime and memory are machine-dependent, and results vary with CPU, OS,
 SciPy build, thermal state and background load. The tracked numbers above were
 produced with the default methodology (one warm-up, three clean repetitions, one
@@ -438,6 +473,12 @@ api/
     main.py             FastAPI application and the two endpoints
     models.py           request and response models
     service.py          adapter from a validated request to one core run
+web/
+    src/
+        App.tsx         layout and run state
+        api.ts          HTTP boundary and error normalisation
+        types.ts        TypeScript mirror of the FastAPI contract
+        components/     parameter form, density canvas, convergence chart, metrics
 tests/
     test_fem.py         element, assembly, reduction and solve validation
     test_filter.py      filter kernel and filtering behaviour
