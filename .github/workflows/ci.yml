@@ -1,0 +1,65 @@
+name: CI
+
+# Every push and every pull request. No branch filter: the gates are cheap
+# enough to run everywhere, and a branch filter is how a broken commit reaches
+# main unnoticed.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          # The floor of the documented stack, not the newest interpreter.
+          # NumPy 2.5.3 and SciPy 1.18.1 both declare requires-python >= 3.12,
+          # so 3.12 is the oldest Python on which the versions this project was
+          # developed and benchmarked against are even installable. On 3.10 or
+          # 3.11 pip would silently resolve an older numerical stack.
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Test
+        run: pytest
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # The locked toolchain requires ^20.19.0 || >=22.12.0 (Vite 7 and
+          # @vitejs/plugin-react 5 are the binding constraints). Node 20 is past
+          # end of life, so CI runs the oldest line still supported: the 22 LTS.
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build

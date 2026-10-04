@@ -1,5 +1,7 @@
 # Topology Optimization
 
+[![CI](https://github.com/Wsxftfgjfkjr/topology-optimization/actions/workflows/ci.yml/badge.svg)](https://github.com/Wsxftfgjfkjr/topology-optimization/actions/workflows/ci.yml)
+
 A lightweight 2D structural topology optimization platform focused on **numerical
 algorithms**, **software architecture** and **performance engineering**.
 
@@ -58,8 +60,10 @@ and container setup a hosted service would need.
 
 ## Architecture
 
-Data flow through one optimization iteration. Everything except the CLI and the
-benchmark harness is in the `topoopt` package.
+Data flow through one optimization iteration, all of which lives in the `topoopt`
+package. The CLI (`examples/`), the benchmark harness
+(`benchmarks/benchmark.py`), the HTTP backend (`api/`) and the web frontend
+(`web/`) sit outside it and drive it from the edges.
 
 ```mermaid
 flowchart TD
@@ -342,6 +346,12 @@ The run reports one `StarletteDeprecationWarning` about `httpx`. Starlette's
 `TestClient` now prefers `httpx2` and warns when it falls back to the
 conventional `httpx`; the fallback works, so the suite stays on the ordinary
 FastAPI testing stack rather than adding a second HTTP client.
+
+CI (`.github/workflows/ci.yml`) runs these same commands on every push and pull
+request: `pytest` for the Python suite, and `npm ci`, `npm run typecheck`,
+`npm test` and `npm run build` in `web/`. The benchmark suite is deliberately not
+part of CI — its numbers are machine-dependent performance evidence, not
+pass/fail checks.
 
 ## Running the benchmarks
 
