@@ -200,13 +200,61 @@ def _moduli(mesh):
     return 1e-9 + np.linspace(0.01, 1.0, mesh.n_elements) ** 3 * (1.0 - 1e-9)
 
 
-@pytest.mark.parametrize("nelx,nely", [(3, 2), (6, 5), (10, 4)])
-def test_cached_assembly_reproduces_the_coo_reference_bit_for_bit(nelx, nely):
-    """The cached structure must not change the assembled numbers at all.
+def _assert_matches_reference(assembled, reference):
+    """Compare a cached assembly against the reference COO scatter.
 
-    Only the summation *order* is at stake: the cached path accumulates entries
-    into their CSC slot in COO order, which is the order SciPy's COO -> CSC
-    conversion sums them in, so even the last bit must survive.
+    The sparse **structure** is a hard invariant. The cached path reuses the
+    same CSC arrays the reference produces, on every platform, so ``indptr`` and
+    ``indices`` must be exactly equal.
+
+    The **values** are a different matter, and deliberately not asserted
+    exactly. Both paths sum the contributions to a CSC slot in COO input order,
+    but SciPy reaches that order through ``sum_duplicates`` -> ``sort_indices``,
+    which sorts ``(index, value)`` pairs with ``std::sort``. That sort is *not
+    stable*, so entries that tie on the row index may be permuted, and which
+    permutation comes out is implementation-defined -- it depends on the C++
+    standard library and on the run length, since ``std::sort`` uses a stable
+    insertion sort for short runs and an unstable introsort beyond that. A
+    column of this mesh holds up to 18 entries, which is past the threshold.
+
+    So the last bits of a slot receiving three or four contributions are a
+    property of the standard library, not of this code. macOS/libc++ happens to
+    reproduce the input order here and is bit-identical; Linux/libstdc++ does
+    not. The portable requirement is agreement to summation roundoff, which is
+    what this checks; anything larger would mean a real assembly defect rather
+    than a reordered sum.
+
+    The bound: a slot receives at most four contributions, because a degree of
+    freedom is shared by at most four Q4 elements. Summing K terms in two
+    different orders differs by at most ``(K - 1) * eps * sum|terms|``, so
+    ``3 * eps * scale`` is the theoretical worst case against the largest entry.
+    Measured over the meshes and moduli fields used below, the worst case is
+    ``1.1 * eps * scale``. ``8`` keeps a margin for other fields while leaving
+    the bound near 1e-15 -- thousands of times below any plausible assembly
+    error, which would displace contributions rather than reorder them.
+    """
+    assert assembled.format == "csc"
+    assert np.array_equal(assembled.indptr, reference.indptr)
+    assert np.array_equal(assembled.indices, reference.indices)
+
+    scale = np.abs(reference.data).max()
+    tolerance = 8.0 * np.finfo(float).eps * scale
+    deviation = np.abs(assembled.data - reference.data).max()
+
+    assert deviation <= tolerance, (
+        f"cached assembly differs from the reference COO scatter by "
+        f"{deviation:.3e}, beyond the {tolerance:.3e} summation-roundoff bound "
+        f"(scale {scale:.3e})"
+    )
+
+
+@pytest.mark.parametrize("nelx,nely", [(3, 2), (6, 5), (10, 4)])
+def test_cached_assembly_matches_the_coo_reference(nelx, nely):
+    """The cached scatter must reproduce the reference assembly.
+
+    Structure exactly, values to summation roundoff -- see
+    :func:`_assert_matches_reference` for why the values cannot be held to the
+    last bit across platforms.
     """
     mesh = fem.Mesh(nelx, nely)
     element_stiffness = fem.element_stiffness_matrix(YOUNGS, POISSON)
@@ -214,14 +262,11 @@ def test_cached_assembly_reproduces_the_coo_reference_bit_for_bit(nelx, nely):
     assembled = fem.assemble_stiffness_matrix(mesh, element_stiffness, _moduli(mesh))
     reference = _reference_assembly(mesh, element_stiffness, _moduli(mesh))
 
-    assert assembled.format == "csc"
-    assert np.array_equal(assembled.indptr, reference.indptr)
-    assert np.array_equal(assembled.indices, reference.indices)
-    assert np.array_equal(assembled.data, reference.data)
+    _assert_matches_reference(assembled, reference)
 
 
 @pytest.mark.parametrize("nelx,nely", [(6, 5), (12, 4)])
-def test_cached_assembly_is_bit_exact_across_unrelated_moduli(nelx, nely):
+def test_cached_assembly_matches_the_reference_across_unrelated_moduli(nelx, nely):
     """The same cached plan must be valid for every value field, not just one."""
     mesh = fem.Mesh(nelx, nely)
     element_stiffness = fem.element_stiffness_matrix(YOUNGS, POISSON)
@@ -236,7 +281,7 @@ def test_cached_assembly_is_bit_exact_across_unrelated_moduli(nelx, nely):
     for moduli in fields:
         assembled = fem.assemble_stiffness_matrix(mesh, element_stiffness, moduli)
         reference = _reference_assembly(mesh, element_stiffness, moduli)
-        assert np.array_equal(assembled.data, reference.data)
+        _assert_matches_reference(assembled, reference)
 
 
 def test_assembly_plan_is_cached_per_mesh():

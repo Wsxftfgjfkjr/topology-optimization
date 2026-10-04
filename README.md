@@ -30,7 +30,7 @@ iterations.*
 | Area | Evidence |
 |---|---|
 | Numerical methods | Q4 plane-stress FEA, SIMP interpolation, self-adjoint compliance sensitivities, cone filter, Optimality Criteria |
-| Verification | Closed-form element energies, a constant-strain patch test, a beam-theory sanity check, filter and OC properties, and bit-exact cross-checks against a reference assembly path |
+| Verification | Closed-form element energies, a constant-strain patch test, a beam-theory sanity check, filter and OC properties, and cross-checks against a reference assembly path down to summation roundoff |
 | Performance engineering | A frozen baseline, an instrumented stage partition, and three controlled experiments — each measured, each checked for numerical equivalence |
 | Engineering judgment | An iterative-solver replacement was investigated and **rejected on evidence**; a direct-solver ordering change was adopted instead |
 
@@ -224,9 +224,15 @@ end-to-end run:
   translation, scaling with the element moduli, and a **constant-strain patch
   test** with analytical consistent nodal loads, which the element space
   reproduces to machine precision.
-- **Assembly and reduction** — the cached assembly and the cached reduced-system
-  extraction are compared **bit-for-bit** against the explicit reference paths,
-  and the reduced-system plan is checked to reject structures it does not match.
+- **Assembly and reduction** — the cached assembly is compared against the
+  explicit COO reference scatter: identical sparsity exactly, and values to
+  summation roundoff. That second bound is not a weakening — the assembled value
+  of a slot receiving several contributions depends on the order they are summed
+  in, and SciPy's COO → CSC path reaches that order through an unstable
+  `std::sort`, so the last bits are a property of the C++ standard library rather
+  than of this code. The cached reduced-system extraction does no arithmetic at
+  all, so it *is* held to bit-for-bit equality. The reduced-system plan is also
+  checked to reject structures it does not match.
 - **Physics sanity check** — a solid slender cantilever's compliance is compared
   against Timoshenko beam theory with a shear correction factor. A
   displacement-based finite element model is stiffer than the exact solution, so
@@ -239,8 +245,10 @@ end-to-end run:
   equalling the summed element strain energies, non-positive sensitivities, and a
   small cantilever smoke test that the loop converges to a finite improved design.
 - **Performance regressions** — the assembly and reduced-system caches are held to
-  bit-exact equivalence with the paths they replaced, and the SuperLU ordering
-  change is held to numerical equivalence with a documented tolerance.
+  the equivalence with the paths they replaced that actually holds on every
+  platform: identical sparsity and values within summation roundoff, and
+  bit-exact where the replacement does no arithmetic. The SuperLU ordering change
+  is held to numerical equivalence with a documented tolerance.
 
 ### Convergence example
 

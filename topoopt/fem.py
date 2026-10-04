@@ -305,10 +305,20 @@ class StiffnessAssemblyPlan:
             element_stiffness.reshape(-1)[None, :] * element_moduli[:, None]
         ).reshape(-1)
 
-        # Each entry adds into the slot of its (row, column) pair.  ``bincount``
-        # walks the entries in COO order and accumulates in place, which is the
-        # same order SciPy's COO -> CSC conversion sums them in, so the result is
-        # bit-for-bit the reference assembly (see tests/test_fem.py).
+        # Each entry adds into the slot of its (row, column) pair: ``bincount``
+        # accumulates exactly the contributions the reference COO scatter
+        # accumulates, and produces the same sparse structure.
+        #
+        # The floating-point values are not guaranteed to match the reference
+        # bit for bit, though, and tests/test_fem.py does not require it.  Both
+        # paths sum a slot's contributions in COO order, but SciPy reaches that
+        # order through ``sum_duplicates`` -> ``sort_indices``, which sorts
+        # ``(index, value)`` pairs with ``std::sort``.  That sort is not stable,
+        # so entries tying on the row index may be permuted and the permutation
+        # is implementation-defined and size-dependent; the last bits of a slot
+        # receiving several contributions are therefore a property of the C++
+        # standard library, not of this code.  The two agree to summation
+        # roundoff, which is the portable requirement.
         data = np.bincount(self.slot, weights=values, minlength=self.nnz)
         return sparse.csc_matrix(
             (data, self.indices, self.indptr), shape=self.shape

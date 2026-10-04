@@ -174,11 +174,27 @@ what an optimization is worth, and the expensive stage was somewhere else.
 RSS delta rose 7.1 → 7.8 MiB (60×20), 43.7 → 49.0 MiB (120×40) and
 188.2 → 200.3 MiB (240×80). That is a real cost paid for the speed.
 
-**Numerical equivalence.** Bit-exact. The scatter accumulates in the same order
-SciPy's COO → CSC conversion sums in, and two tests hold the cached assembly to
-bit-for-bit equality with the explicit reference path, including across unrelated
-moduli. Consistently, the tracked `density_sha256` for `optimized_assembly` is
-identical to `reference` on all three meshes.
+**Numerical equivalence.** The cached scatter produces the same CSC structure as
+the explicit reference path exactly, and the same values to summation roundoff.
+Two tests hold it to that, including across unrelated moduli fields.
+
+Bit identity is deliberately *not* required, because it is not portable here.
+Both paths sum each slot's contributions in COO input order, but SciPy reaches
+that order through `sum_duplicates` → `sort_indices`, which sorts
+`(index, value)` pairs with `std::sort`. That sort is not stable, so entries
+tying on the row index may be permuted, and which permutation comes out depends
+on the C++ standard library and on the run length — `std::sort` is a stable
+insertion sort for short runs and an unstable introsort beyond that, and a
+column of this mesh holds up to 18 entries. So the last bits of a slot that
+receives three or four contributions are a property of the standard library, not
+of this code: macOS/libc++ reproduces the input order, Linux/libstdc++ does not.
+An early version of these tests asserted bit equality and passed on macOS while
+failing on Linux for exactly this reason.
+
+On the reference environment the two paths did come out bit-identical, which is
+why the tracked `density_sha256` for `optimized_assembly` matches `reference` on
+all three meshes. That is an observation about that environment, not a property
+the code guarantees.
 
 ## 4. Experiment 2 — reduced-system extraction caching
 
@@ -242,8 +258,12 @@ from 0.377 to 0.668 ms (60×20), 1.024 to 2.085 ms (120×40) and 3.474 to 7.379 
 trade is clearly favourable — but it is a trade, and it is only invisible because
 the methodology excludes construction from the measured region.
 
-**Numerical equivalence.** Bit-exact, for the same reason as Experiment 1: the
-selection reorders nothing. `optimized_reduced`'s tracked `density_sha256` matches
+**Numerical equivalence.** Bit-exact — and unlike Experiment 1, that claim is
+portable. The reduction performs no arithmetic at all: it is the boolean
+selection `stiffness.data[keep]`, so there is no summation order to disagree
+about and nothing for a different standard library to permute. The cached
+extraction is held to exact equality with the reference slicing on every array,
+structure included. `optimized_reduced`'s tracked `density_sha256` matches
 `reference` on all three meshes.
 
 ## 5. Experiment 3A — solver investigation
